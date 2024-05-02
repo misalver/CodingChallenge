@@ -1,1 +1,504 @@
+---
+title: "CODING CHALLENGE – DATA SCIENTIST"
+author: "MSalvermoser"
+date: "03.05.2024"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+editor_options: 
+  chunk_output_type: console
+---
 
+# Setup
+
+## Load Libraries
+
+```{r, collapse=TRUE}
+library(foreign)
+library(tidyverse)
+library(patchwork)
+library(scales)
+library(tableone)
+require(forcats)
+library(glmnet)
+require(splitTools)
+library(plotROC)
+```
+
+## Helper Functions
+
+
+
+# Load Data
+
+## freMTPL2freq 
+
+The dataset freMTPL2freq contains risk features for 677,991 motor third-part liability policies (observed mostly on one year). See https://github.com/dutangc/CASdatasets for more details. The dataset is associated with 'Computational Actuarial Science with R' edited by Arthur Charpentier, CRC, 2018.
+
+- IDpol is unique variable
+
+
+```{r}
+data_freq = read.arff("freMTPL2freq.arff") %>% 
+  as_tibble() %>% 
+  mutate(
+    VehGas = factor(VehGas, levels=c("Regular", "Diesel"))
+  )
+
+```
+
+
+## freMTPL2sev
+
+The dataset freMTPL2sev contains claim amounts for 26,639 motor third-part liability policies.
+
+
+```{r}
+# there can be more than one row per IDpol -> Summarise using sum
+
+data_sev = read.arff("freMTPL2sev.arff") %>% 
+  as_tibble() %>% 
+  group_by(IDpol) %>% 
+  summarise(ClaimAmount = sum(ClaimAmount)) %>% 
+  ungroup()
+```
+
+## Combine Data
+
+```{r}
+data_complete = left_join(data_freq, data_sev, by="IDpol") 
+
+rm(data_freq, data_sev)
+```
+
+There are cases with ClaimNb > 0 but without ClaimAmount
+
+```{r}
+data_complete %>% filter(is.na(ClaimAmount) & ClaimNb > 0) 
+
+# TODO How to handle those?
+# DECISION Remove from data set and create variable of interest
+
+data_complete = data_complete %>% 
+  filter(!is.na(ClaimAmount) | ClaimNb == 0)  %>% 
+  mutate(
+    Claim_yn = as.integer(!is.na(ClaimAmount)),
+    # calculate ClaimAmount per year of exposure
+    ClaimAmount_pa = ClaimAmount / pmax(Exposure, 1/12),
+    ClaimAmount_palog2 = log2(ClaimAmount_pa)
+    )
+```
+
+Only a small proportion has made a claim
+```{r}
+table(data_complete[["ClaimAmount"]] > 0) / nrow(data_complete)
+```
+
+
+## Outcome related Vairables
+
+```{r}
+# Wie viele Verträge mit Claim gibt es?
+sum(data_complete$Claim_yn)
+percent(sum(data_complete$Claim_yn) / nrow(data_complete), accuracy=.01)
+
+# Wie hoch sind diese Claims bei welcher Laufzeit?
+p_data = filter(data_complete, Claim_yn==1)
+
+
+ggplot(p_data)+
+  aes(x=Exposure, y=ClaimAmount)+
+  geom_point(alpha=.5)
+
+# Es gibt 4 sehr hohe Claims
+# TODO Nachforschen
+
+p_data %>% filter(ClaimAmount > 5e5)
+```
+
+
+```{r}
+# Data is Gamma distributed -> log2 transformation
+ggplot(p_data)+
+  aes(x=Exposure, y=log2(ClaimAmount))+
+  geom_point(alpha=.5)+
+  scale_y_continuous(breaks=2*(0:12))
+
+```
+
+```{r}
+# Data is Gamma distributed -> log2 transformation
+p1 = ggplot(p_data)+
+  aes(x=Exposure, y=log2(ClaimAmount_pa))+
+  geom_point(alpha=.5)+
+  geom_smooth()
+
+
+p2 = ggplot(p_data)+
+  aes(x=Exposure, y=log2(ClaimAmount / Exposure))+
+  geom_point(alpha=.5)+
+  geom_smooth()
+
+
+p1 +p2
+
+rm(p1, p2, p_data)
+```
+
+## Correlation
+
+```{r}
+data_complete %>% 
+  select(Exposure, VehPower, VehAge, DrivAge, BonusMalus, Density) %>% 
+  cor(method = "spearman") %>% 
+  ggcorrplot::ggcorrplot()
+
+```
+
+```{r}
+data_complete %>% 
+  filter(!is.na(ClaimAmount_pa)) %>% 
+  select(ClaimAmount_pa, ClaimAmount, Exposure, VehPower, VehAge, DrivAge, BonusMalus, Density) %>% 
+  cor(method = "spearman") %>% 
+  ggcorrplot::ggcorrplot()
+
+```
+
+
+## Density x Region and Area
+
+```{r}
+lm(Density ~ fct_rev(Region), data=data_complete) %>% 
+  summary()
+lm(Density ~ Area, data=data_complete) %>% 
+  summary()
+
+hist(data_complete$Density)
+hist(log2(data_complete$Density))
+
+table(data_complete$Area, data_complete$Region)
+```
+
+## BonusMalus x Age
+
+```{r}
+
+q_BM = quantile(unique(data_complete$BonusMalus), probs=seq(0, 1, .1))
+
+
+p_data = data_complete %>% 
+  select(BonusMalus, DrivAge, ClaimAmount_pa, ClaimAmount_palog2) %>% 
+  mutate(
+    BonusMalus = cut(BonusMalus, breaks=q_BM, include.lowest=TRUE),
+    DrivAge_d = cut(DrivAge, breaks=seq(18, 103, 5), include.lowest=TRUE)
+  )
+
+ggplot(p_data)+
+  aes(x=BonusMalus, y=log2(ClaimAmount_pa))+
+  geom_boxplot()
+
+ggplot(p_data)+
+  aes(x=DrivAge_d, y=log2(ClaimAmount_pa))+
+  geom_boxplot()
+
+ggplot(p_data)+
+  aes(x=BonusMalus, y=DrivAge)+
+  geom_boxplot()
+
+rm(p_data, q_BM)
+
+```
+
+
+
+
+# Prepare data splits for modelling
+
+```{r}
+# prepare Data
+data_complete = data_complete %>% 
+  mutate(
+    Density = log2(Density),
+    BonusMalus = cut(
+      BonusMalus, breaks=c(50, 100, 150, 250), 
+      labels=c("<100", "100-150", ">150"), include.lowest=TRUE
+    ),
+    DrivAge = DrivAge / 10
+  )
+
+
+# Split data in Training and Validation data set with 2:1 ratio
+index = partition(data_complete$Claim_yn, p=c(train=2/3, valid=1/3), seed=12, shuffle=TRUE)
+
+data_trainA = data_complete[index$train,] 
+data_validA = data_complete[index$valid,]
+
+# CV split for logisic regression
+cv_strategy = c(Fold1=1, Fold2=1, Fold3=1, Fold4=1, Fold5=1)/5
+cv_index_listA = partition(data_trainA$Claim_yn, p=cv_strategy, seed=12, shuffle=FALSE)
+
+cv_indexA = enframe(cv_index_listA) %>% 
+  unnest_longer(value, values_to="row_index") %>% 
+  arrange(row_index) %>% 
+  mutate(fold = as.numeric(gsub("^Fold", "", name))) %>% 
+  pull(fold)
+
+# CV Split for linear regression
+
+data_trainB = filter(data_trainA, !is.na(ClaimAmount))
+data_validB = filter(data_validA, !is.na(ClaimAmount))
+
+cv_index_listB = partition(
+  data_trainB$ClaimAmount_palog2, p=cv_strategy, 
+  seed=12, shuffle=FALSE
+)
+
+cv_indexB = enframe(cv_index_listB) %>% 
+  unnest_longer(value, values_to="row_index") %>% 
+  arrange(row_index) %>% 
+  mutate(fold = as.numeric(gsub("^Fold", "", name))) %>% 
+  pull(fold)
+
+rm(cv_strategy, cv_index_listA, cv_index_listB, index)
+```
+
+
+# Table 1
+
+```{r}
+
+CreateTableOne(
+  vars=c("Exposure", "VehPower", "VehAge", "DrivAge", "BonusMalus", "VehBrand", 
+         "VehGas", "Density", "Region"),
+  strata="Claim_yn",
+  data = data_trainA
+)
+
+```
+
+
+# Model A: ClaimNb > 0
+
+## Fit LASSO
+
+```{r}
+y_train = data_trainA[["Claim_yn"]]
+
+x_train = model.matrix(
+  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Density + Region, # + Area, 
+  data=data_trainA
+)
+
+x_valid = model.matrix(
+  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Density + Region, # + Area, 
+  data=data_validA
+)
+
+
+dim(x_train)
+
+fit_modelA = cv.glmnet(x_train, y_train, foldid=cv_indexA, family="binomial")
+
+
+
+plot(fit_modelA)
+
+coef.glmnet(fit_modelA$glmnet.fit, s=fit_modelA$lambda.1se) %>% 
+  as.matrix() %>% 
+  as_tibble(rownames="term") %>% 
+  filter(s1 != 0) %>% 
+  filter(!grepl("Intercept", term)) %>% 
+  ggplot(aes(x=exp(s1), y=fct_inorder(term)))+
+    geom_point(size=1)
+
+
+
+```
+
+## Evaluate predcition on training and validation data 
+
+
+```{r}
+
+ypred_train = predict.glmnet(
+  fit_modelA$glmnet.fit, 
+  s=fit_modelA$lambda.1se, 
+  newx=x_train
+)[,1] %>% 
+  {1/exp(-.)}
+
+data_trainA = data_trainA %>% 
+  mutate(ypred = ypred_train)
+
+ypred_valid = predict.glmnet(
+  fit_modelA$glmnet.fit, 
+  s=fit_modelA$lambda.1se, 
+  newx=x_valid
+)[,1] %>% 
+  {1/exp(-.)}
+
+data_validA = data_validA %>% 
+  mutate(ypred = ypred_valid)
+
+
+pROC::roc(data_trainA[["Claim_yn"]], data_trainA[["ypred"]])
+pROC::roc(data_validA[["Claim_yn"]], data_validA[["ypred"]])
+
+
+ggplot()+
+  geom_roc(
+    data=data_trainA, aes(d=Claim_yn*1, m=ypred, color="Train"), 
+    labels=FALSE, n.cuts=5
+  )+
+  geom_roc(
+    data=data_validA, aes(d=Claim_yn*1, m=ypred, color="Valid"), 
+    labels=FALSE, n.cuts=5
+  )+
+  geom_abline(slope=1, intercept=0)+
+  scale_colour_manual("Data", values=c("Train"="blue","Valid"="red"))
+
+# Compare estimated Cases and observed cases 
+# Training data
+sum(data_trainA$ypred) / sum(data_trainA$Claim_yn)
+# Validataion Data
+sum(data_validA$ypred) / sum(data_validA$Claim_yn)
+
+ggplot(data_validA)+
+  aes(x=factor(Claim_yn), y=ypred)+
+  geom_boxplot()
+
+```
+
+```{r}
+rm(x_train, x_valid, y_train, ypred_train, ypred_valid)
+```
+
+
+# Model B: Estimate ClaimAmount
+
+## Fit LASSO
+
+```{r}
+
+y_train = data_trainB[["ClaimAmount_palog2"]]
+
+x_train = model.matrix(
+  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Density + Region, # + Area, 
+  data=data_trainB
+)
+
+x_valid = model.matrix(
+  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Density + Region, # + Area, 
+  data=data_validB
+)
+
+
+
+fit_modelB_lasso = cv.glmnet(x_train, y_train, foldid=cv_indexB)
+
+# fit_modelB_lm = lm(
+#   ClaimAmount_palog2  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + 
+#     VehGas + Density + Region + Area,
+#   data=data_trainB
+# )
+
+plot(fit_modelB_lasso)
+
+
+
+```
+
+
+## Evaluate Models
+
+### Train data
+
+```{r}
+denom = predict.glmnet(
+  fit_modelB_lasso$glmnet.fit, 
+  newx=x_train, 
+  s=fit_modelB_lasso$lambda.min, 
+  type="link"
+)[,1] %>% 
+  {2^.} %>% # transform to original scale
+  sum()
+denom
+
+sum(data_trainB$ClaimAmount_pa)
+
+claim_factor = 105630053 / denom # Scale estimate with this factor
+
+
+```
+
+```{r}
+
+
+data_validB = data_validB %>% 
+  mutate(
+    ypredB = predict.glmnet(
+      fit_modelB_lasso$glmnet.fit, 
+      newx=x_valid, 
+      s=fit_modelB_lasso$lambda.min, 
+      type="link"
+    )[,1] %>% 
+      {(2^.)*claim_factor}
+  )
+
+sum(data_validB$ClaimAmount_pa)
+sum(data_validB$ypredB)
+
+
+ggplot(data_validB)+
+  aes(x=log2(ClaimAmount_pa), y=log2(ypredB))+
+  geom_abline(slope=1, intercept=0)+
+  geom_point(alpha=.3)
+```
+
+
+
+# Evaluation of ModelA and ModelB
+
+```{r}
+x_valid = model.matrix(
+  ~ VehPower + VehAge + DrivAge + BonusMalus + VehBrand + VehGas + Density + Region, # + Area, 
+  data=data_validA
+)
+
+dim(x_valid)
+
+# Predict Probability
+prob_Claim = predict.glmnet(
+  fit_modelA$glmnet.fit, 
+  s=fit_modelA$lambda.1se, 
+  newx=x_valid
+)[,1] %>% 
+  {1/exp(-.)}
+
+# Estimate ClaimAmount pa
+est_ClaimAmount = predict.glmnet(
+  fit_modelB_lasso$glmnet.fit, 
+  s=fit_modelB_lasso$lambda.min, 
+  newx=x_valid
+)[,1] %>% 
+  {(2^.)*claim_factor}
+
+
+data_validA = data_validA %>% 
+  mutate(
+    prob_Claim = prob_Claim,
+    est_ClaimAmount = est_ClaimAmount,
+    est_Tarif = prob_Claim * est_ClaimAmount
+  )
+
+
+sum(data_validA$est_Tarif)
+sum(data_validA$ClaimAmount_pa, na.rm=TRUE)
+
+data_validA$est_Tarif[1:5]
+```
